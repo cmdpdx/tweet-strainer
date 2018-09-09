@@ -225,7 +225,7 @@ class TweetStrainer(object):
     if on_data is None:
       self.on_data = lambda t: print(t["text"])
     else:
-      if not callable(on_data): raise TypeError
+      if not callable(on_data): raise TypeError("on_data parameter must be a callable")
       self.on_data = on_data
 
     self._queue = Queue()
