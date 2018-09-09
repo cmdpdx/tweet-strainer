@@ -50,7 +50,7 @@ class _StreamFilterThread(Thread):
     self._retry_count = options.get("retry_count")
 
   def _parse_stream(self, resp):
-    """ Parse incoming tweets from the streaming response and put them in a thread queue.
+    """Parse incoming tweets from the streaming response and put them in a thread queue.
 
     Detects keep-alive newlines sent every ~30 seconds. If a keep-alive is detected,
     no tweets have been received for a while so the thread sleeps for a brief time to yield
@@ -89,7 +89,7 @@ class _StreamFilterThread(Thread):
     self.running = False   
 
   def run(self):
-    """ Begin monitoring the Twitter stream.
+    """Begin monitoring the Twitter stream.
 
     Opens a streaming connection to the Twitter filter stream.  Keeps running until interrupted
     in some way (keyboard interrupt, lost connection, timeout, etc). 
@@ -158,7 +158,7 @@ class _StreamFilterThread(Thread):
       raise exc_info[0]
     
   def new_session(self):
-    """ Create a new session for the thread and assign the proper OAuth1 credentials. """
+    """Create a new session for the thread and assign the proper OAuth1 credentials. """
     self.session = requests.Session()
     self.session.params = None
     self.session.auth = OAuth1(
@@ -176,11 +176,13 @@ class _TweetConsumerThread(Thread):
 
   Instance members:
   queue -- the shared queue with the producer, holds tweets as byte strings to be processed.
+  on_data -- callback function used whenever a tweet is processed
   """
   
-  def __init__(self, queue, verbose=True):
+  def __init__(self, queue, on_data, verbose=True):
     super().__init__()
     self.queue = queue
+    self.on_data = on_data
     self.verbose = verbose
 
   def run(self):
@@ -197,11 +199,52 @@ class _TweetConsumerThread(Thread):
       except json.JSONDecodeError as err:
         print("Found an object not properly JSON formatted...")
       else:
-        if self.verbose: self.print_tweet(tweet)
+        self.on_data(tweet)
       finally:
         self.queue.task_done()
+      
+
+class TweetStrainer(object):
+  """Connect to the Twitter stream and track the given terms.
+
+  Wrapper class for the producer/consumer pair of classes _StreamFilterThread and 
+  _TweetConsumerThread. 
   
-  def print_tweet(self, tweet):
+  Instance members:
+  track -- list of string terms to track
+  on_data -- callback function passed to the consumer thread; called when a tweet
+    is processed. If no callback is provided, text of the tweet is printed by default.
+  """
+  
+  def __init__(self, track, on_data=None):
+    if isinstance(track, list):
+      self.track = list(map(str, track))
+    else:
+      self.track = [str(track)]
+    
+    if on_data is None:
+      self.on_data = lambda t: print(t["text"])
+    else:
+      if not callable(on_data): raise TypeError
+      self.on_data = on_data
+
+    self._queue = Queue()
+    self._threads = [
+      _StreamFilterThread(self._queue, track=self.track),
+      _TweetConsumerThread(self._queue, self.on_data)
+    ]
+      
+  def run(self):
+    """Run the producer/consumer threads, wait until they end."""
+    for thread in self._threads:
+      thread.start()
+
+    for thread in self._threads:
+      thread.join()
+
+
+if __name__ == "__main__":
+  def print_tweet(tweet):
     text = tweet["text"]
     user = tweet["user"]["screen_name"]
     if "retweeted_status" in tweet:
@@ -216,38 +259,6 @@ class _TweetConsumerThread(Thread):
     print(text)
     print(tweet['user']['location'])
     print()
-      
 
-class TweetStrainer(object):
-  """Connect to the Twitter stream and track the given terms.
-
-  Wrapper class for the producer/consumer pair of classes _StreamFilterThread and 
-  _TweetConsumerThread. 
-  
-  Instance members:
-  track -- list of string terms to track
-  """
-  def __init__(self, track):
-    if isinstance(track, list):
-      self.track = list(map(str, track))
-    else:
-      self.track = [str(track)]
-
-    self._queue = Queue()
-    self._threads = [
-      _StreamFilterThread(self._queue, track=self.track),
-      _TweetConsumerThread(self._queue)
-    ]
-      
-  def run(self):
-    """Run the producer/consumer threads, wait until they end."""
-    for thread in self._threads:
-      thread.start()
-
-    for thread in self._threads:
-      thread.join()
-
-
-if __name__ == "__main__":
-  ts = TweetStrainer("portland")
+  ts = TweetStrainer("portland", print_tweet)
   ts.run()
