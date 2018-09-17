@@ -4,11 +4,116 @@ from requests_oauthlib import OAuth1
 
 import requests
 import time
+from datetime import datetime
 import json
 import ssl
 import sys
 
 from config import Config
+
+
+class Tweet(object):
+  """Container for information contained in a tweet object.
+
+  This class does not represent a complete tweet; only some of the data has been selected
+  to be saved from the tweet. As more functionality is added to the library, more information
+  will be saved from each tweet.
+
+  Properties:
+  created_at -- datetime.datetime representing when the tweet was created/sent
+  text -- string of the text of the tweet. This should be the full text, regardless of retweet/truncation
+  screen_name -- string of the screen name of the tweeting user
+  name -- string of the full name of the tweeting user
+  is_retweet -- boolean whether or not this is a retweet
+  rt_screen_name -- string of the screen name of the original author (if retweet)
+  rt_name -- string of the full name of the original author (if retweet)
+  hashtags -- list of any hashtags included in the text of the tweet (w/o the # symbol). Can be empty []
+  """
+
+  def __init__(self, tweet_dict):
+    self._user = {}
+    self._user["name"] = tweet_dict["user"]["name"]
+    self._user["screen_name"] = tweet_dict["user"]["screen_name"]
+    self._user["location"] = tweet_dict["user"]["location"]
+    self._created_at = datetime.strptime(tweet_dict["created_at"], "%a %b %d %H:%M:%S %z %Y")
+    self._is_retweet = False
+    self._rt_user = None
+    self._hashtags = []
+
+    t = tweet_dict
+    # check if this is a retweet, grab the original tweet
+    # and user
+    if "retweeted_status" in t:
+      self._is_retweet = True
+      t = t["retweeted_status"]
+      self._rt_user = {
+        "name": t["user"]["name"],
+        "screen_name": t["user"]["screen_name"],
+        "location": t["user"]["location"]
+      }
+    
+    # is this a new 240 char tweet?
+    if t["truncated"]:
+      t = t["extended_tweet"]
+      self._text = t["full_text"]
+    else:
+      self._text = t["text"]
+
+    # get hashtags
+    self._hashtags = [tag["text"] for tag in t["entities"]["hashtags"]]
+
+    # get user-mentions
+    self._user_mentions = []
+    for u in t["entities"]["user_mentions"]:
+      user = {
+        "name": u["name"],
+        "screen_name": u["screen_name"]
+      }
+      self._user_mentions.append(user)
+
+  @property
+  def created_at(self):
+    """Get the timestamp of the tweet as a datetime.datetime."""
+    return self._created_at
+
+  @property
+  def text(self):
+    """Get the text of the tweet."""
+    return self._text
+
+  @property
+  def screen_name(self):
+    """Get the screen name of the tweet author."""
+    return self._user["screen_name"] 
+
+  @property
+  def name(self):
+    """Get the full name of the tweet author."""
+    return self._user["name"]
+
+  @property
+  def is_retweet(self):
+    return self._is_retweet
+    
+  @property
+  def rt_screen_name(self):
+    """Get the screen name of the retweeted user, or None if not a retweet."""
+    if not self._is_retweet:
+      return None
+    return self._rt_user["screen_name"]
+
+  @property
+  def rt_name(self):
+    """Get the full name of the retweeted user, or None if not a retweet."""
+    if not self._is_retweet:
+      return None
+    return self._rt_user["name"]
+
+  @property
+  def hashtags(self):
+    """Get a list of hastags in the tweet. Could be empty."""
+    return self._hashtags 
+
 
 class _StreamFilterThread(Thread):
   """Filter the Twitter stream and store tweets matching the given criteria.
@@ -27,7 +132,7 @@ class _StreamFilterThread(Thread):
   track -- list of terms to filter for
   """
 
-  def __init__(self, queue, verbose=True, **options):
+  def __init__(self, queue, verbose=False, **options):
     super().__init__()
     self.queue = queue
     self.verbose = verbose
@@ -81,8 +186,9 @@ class _StreamFilterThread(Thread):
           # sometimes multiple newlines are sent rapidly, make sure this is a "real" keep-alive
           now = time.perf_counter()
           if now - last_keep_alive > 5:
+            elapsed = now - last_keep_alive
             last_keep_alive = now
-            if verb: print("<< READER >> keep alive detected; sleeping to yield.\n")
+            if verb: print("<< READER >> keep alive detected ({:.2f} sec elapsed); sleeping to yield.\n".format(elapsed))
             time.sleep(1)
 
     if verb: print("stopped running or connection closed") 
@@ -132,7 +238,7 @@ class _StreamFilterThread(Thread):
           self.running = False
         # 200: Success! 
         else:
-          if verb: print(">> Connected to Twitter stream:", self.track)
+          print(">> Connected to Twitter stream:", self.track)
           self._parse_stream(resp)
       except (requests.exceptions.Timeout, ssl.SSLError) as e:
         # if its an SSL error and isn't related to timing out, treat like any other exception
@@ -146,12 +252,14 @@ class _StreamFilterThread(Thread):
         self.snooze_time = min(self.snooze_time, self._snooze_time_cap)
       except Exception as e:
         exc_info = sys.exc_info()
+        print(">> Exception occurred:", exc_info[1])
         break
     
     # cleanup
     self.running = False
     if resp: resp.close()
     self.new_session()
+    self.queue.put(None)
 
     # Re-raise any exceptions not addressed
     if exc_info is not None:
@@ -176,7 +284,8 @@ class _TweetConsumerThread(Thread):
 
   Instance members:
   queue -- the shared queue with the producer, holds tweets as byte strings to be processed.
-  on_data -- callback function used whenever a tweet is processed
+  on_data -- callback function used whenever a tweet is processed. Must accept a single parameter
+    that is of type Tweet
   """
   
   def __init__(self, queue, on_data, verbose=True):
@@ -193,13 +302,16 @@ class _TweetConsumerThread(Thread):
     """
     while True:
       tweet_obj = self.queue.get()
-      tweet = None
+      # if None is found, the producer thread has shut down
+      if tweet_obj is None:
+        self.queue.task_done()
+        break
       try:
-        tweet = json.loads(tweet_obj)
+        tweet_dict = json.loads(tweet_obj)
       except json.JSONDecodeError as err:
         print("Found an object not properly JSON formatted...")
       else:
-        self.on_data(tweet)
+        self.on_data(Tweet(tweet_dict))
       finally:
         self.queue.task_done()
       
@@ -213,7 +325,8 @@ class TweetStrainer(object):
   Instance members:
   track -- list of string terms to track
   on_data -- callback function passed to the consumer thread; called when a tweet
-    is processed. If no callback is provided, text of the tweet is printed by default.
+    is processed. Must accept a single parameter of type Tweet. If no callback is 
+    provided, text of the tweet is printed by default.
   """
   
   def __init__(self, track, on_data=None):
@@ -223,7 +336,7 @@ class TweetStrainer(object):
       self.track = [str(track)]
     
     if on_data is None:
-      self.on_data = lambda t: print(t["text"])
+      self.on_data = lambda tweet: print(tweet.text)
     else:
       if not callable(on_data): raise TypeError("on_data parameter must be a callable")
       self.on_data = on_data
@@ -244,21 +357,5 @@ class TweetStrainer(object):
 
 
 if __name__ == "__main__":
-  def print_tweet(tweet):
-    text = tweet["text"]
-    user = tweet["user"]["screen_name"]
-    if "retweeted_status" in tweet:
-      re = tweet["retweeted_status"]
-      print(">> RETWEET <<")
-      user = tweet["user"]["screen_name"] + " RT'd " + re["user"]["screen_name"]
-      text = re["text"]
-    if tweet['truncated']:
-      print('>> LONG TWEET <<')
-      text = tweet['extended_tweet']['full_text']
-    print(user, ">> ", end='')
-    print(text)
-    print(tweet['user']['location'])
-    print()
-
-  ts = TweetStrainer("portland", print_tweet)
+  ts = TweetStrainer("portland")
   ts.run()
