@@ -28,9 +28,12 @@ class Tweet(object):
   rt_screen_name -- string of the screen name of the original author (if retweet)
   rt_name -- string of the full name of the original author (if retweet)
   hashtags -- list of any hashtags included in the text of the tweet (w/o the # symbol). Can be empty []
+  urls -- list of any urls included in the tweet. Can be empty []
+  user_mentions -- list of dicts ("name", "screen_name") of users mentioned in the tweet. Can be empty []
   """
 
   def __init__(self, tweet_dict):
+    self._id_str = tweet_dict["id_str"]
     self._user = {}
     self._user["name"] = tweet_dict["user"]["name"]
     self._user["screen_name"] = tweet_dict["user"]["screen_name"]
@@ -38,38 +41,40 @@ class Tweet(object):
     self._created_at = datetime.strptime(tweet_dict["created_at"], "%a %b %d %H:%M:%S %z %Y")
     self._is_retweet = False
     self._rt_user = None
-    self._hashtags = []
 
-    t = tweet_dict
+    tweet = tweet_dict
     # check if this is a retweet, grab the original tweet
     # and user
-    if "retweeted_status" in t:
+    if "retweeted_status" in tweet:
       self._is_retweet = True
-      t = t["retweeted_status"]
+      tweet = tweet["retweeted_status"]
       self._rt_user = {
-        "name": t["user"]["name"],
-        "screen_name": t["user"]["screen_name"],
-        "location": t["user"]["location"]
+        "name": tweet["user"]["name"],
+        "screen_name": tweet["user"]["screen_name"],
+        "location": tweet["user"]["location"]
       }
     
     # is this a new 240 char tweet?
-    if t["truncated"]:
-      t = t["extended_tweet"]
-      self._text = t["full_text"]
+    if tweet["truncated"]:
+      tweet = tweet["extended_tweet"]
+      self._text = tweet["full_text"]
     else:
-      self._text = t["text"]
+      self._text = tweet["text"]
 
     # get hashtags
-    self._hashtags = [tag["text"] for tag in t["entities"]["hashtags"]]
+    self._hashtags = [tag["text"] for tag in tweet["entities"]["hashtags"]]
 
     # get user-mentions
     self._user_mentions = []
-    for u in t["entities"]["user_mentions"]:
+    for u in tweet["entities"]["user_mentions"]:
       user = {
         "name": u["name"],
         "screen_name": u["screen_name"]
       }
       self._user_mentions.append(user)
+
+    # get urls
+    self._urls = [url["expanded_url"] for url in tweet["entities"]["urls"]]
 
   @property
   def created_at(self):
@@ -114,6 +119,16 @@ class Tweet(object):
     """Get a list of hastags in the tweet. Could be empty."""
     return self._hashtags 
 
+  @property
+  def urls(self):
+    """Get a list of urls in the tweet. Could be empty."""
+    return self._urls
+
+  @property
+  def user_mentions(self):
+    """Get a list of dicts (with keys "name" and "screen_name") of users mentioned in the tweet."""
+    return self._user_mentions
+    
 
 class _StreamFilterThread(Thread):
   """Filter the Twitter stream and store tweets matching the given criteria.
@@ -136,12 +151,13 @@ class _StreamFilterThread(Thread):
     super().__init__()
     self.queue = queue
     self.verbose = verbose
-    self.new_session()
     self.track = options.get("track")
     if self.track is not None and not isinstance(self.track, list):
       self.track = [self.track]
     self.url = 'https://stream.twitter.com/1.1/statuses/filter.json'
+    self.new_session()
     self.running = False
+    self._yield_time = 1  # how long to sleep when yielding to consumer
     
     # Below directly from tweepy/streaming.py: https://github.com/tweepy/tweepy
     # values according to
@@ -179,17 +195,16 @@ class _StreamFilterThread(Thread):
           if tweets_read > 10:
             # give the consumer a chance to catch up and clear the queue
             if verb: print("<< READER >> loaded 10 tweets...sleeping....\n")
-            time.sleep(1)
+            time.sleep(self._yield_time)
             tweets_read = 0
         elif next_tweet == b'':
           # got a newline keep-alive, count it and sleep so consumer can catch up
           # sometimes multiple newlines are sent rapidly, make sure this is a "real" keep-alive
           now = time.perf_counter()
           if now - last_keep_alive > 5:
-            elapsed = now - last_keep_alive
             last_keep_alive = now
-            if verb: print("<< READER >> keep alive detected ({:.2f} sec elapsed); sleeping to yield.\n".format(elapsed))
-            time.sleep(1)
+            if verb: print("<< READER >> keep alive detected; sleeping to yield.\n")
+            time.sleep(self._yield_time)
 
     if verb: print("stopped running or connection closed") 
     self.running = False   
@@ -203,8 +218,6 @@ class _StreamFilterThread(Thread):
     """ 
     verb = self.verbose
     self.running = True
-    self.session.params = {}
-    self.session.params["track"] = u','.join(self.track)
 
     exc_info = None
     retry_time = self._retry_time_start
@@ -212,7 +225,7 @@ class _StreamFilterThread(Thread):
     snooze_time = self._snooze_time_step
     while self.running:
       try:
-        resp = self.session.post(self.url, stream=True, timeout=30)
+        resp = self.session.post(self.url, stream=True, timeout=90)
         # 420: Rate Limited; connected too frequently. 
         # Wait 1 minute, back-off exponentially (x2) for each subsequent 420 status
         if resp.status_code == 420:
@@ -252,7 +265,6 @@ class _StreamFilterThread(Thread):
         self.snooze_time = min(self.snooze_time, self._snooze_time_cap)
       except Exception as e:
         exc_info = sys.exc_info()
-        print(">> Exception occurred:", exc_info[1])
         break
     
     # cleanup
@@ -268,7 +280,8 @@ class _StreamFilterThread(Thread):
   def new_session(self):
     """Create a new session for the thread and assign the proper OAuth1 credentials. """
     self.session = requests.Session()
-    self.session.params = None
+    self.session.params = {}
+    self.session.params["track"] = u','.join(self.track)
     self.session.auth = OAuth1(
       Config.client_id, 
       client_secret=Config.client_secret,
@@ -302,9 +315,7 @@ class _TweetConsumerThread(Thread):
     """
     while True:
       tweet_obj = self.queue.get()
-      # if None is found, the producer thread has shut down
       if tweet_obj is None:
-        self.queue.task_done()
         break
       try:
         tweet_dict = json.loads(tweet_obj)
@@ -328,7 +339,7 @@ class TweetStrainer(object):
     is processed. Must accept a single parameter of type Tweet. If no callback is 
     provided, text of the tweet is printed by default.
   """
-  
+
   def __init__(self, track, on_data=None):
     if isinstance(track, list):
       self.track = list(map(str, track))
