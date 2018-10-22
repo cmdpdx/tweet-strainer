@@ -1,5 +1,5 @@
 from config import Config
-from tweet_stream import TweetStrainer, Tweet
+from tweet_strainer import TweetStrainer, Tweet
 
 class TweetResponder(object):
   def __init__(self, hashtags):
